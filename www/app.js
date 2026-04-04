@@ -5,6 +5,40 @@
 // ═══════════════════════════════════════════════════════════════
 
 const PLAYER_COLORS = { 1: '#e74c3c', 2: '#3498db', 3: '#f1c40f', 4: '#2ecc71' };
+const BUTTON_IDS = {
+  A: 1,
+  B: 2,
+  X: 3,
+  Y: 4,
+  L: 5,
+  R: 6,
+  Z: 7,
+  START: 8,
+  UP: 9,
+  DOWN: 10,
+  LEFT: 11,
+  RIGHT: 12,
+};
+const PROTOCOL_BUTTON_PLAYER = 0;
+const PROTOCOL_BUTTON_HEARTBEAT = 255;
+const ACTION_RELEASE = 0;
+const ACTION_PRESS = 1;
+const HEARTBEAT_FRAME = Uint8Array.of(PROTOCOL_BUTTON_HEARTBEAT, 0);
+const HEARTBEAT_INTERVAL_MS = 1000;
+const HEARTBEAT_TIMEOUT_MS = 4000;
+const PLAYER_HANDSHAKES = [null];
+const INPUT_FRAMES = Object.create(null);
+
+for (let player = 1; player <= 4; player += 1) {
+  PLAYER_HANDSHAKES[player] = Uint8Array.of(PROTOCOL_BUTTON_PLAYER, player);
+}
+
+Object.entries(BUTTON_IDS).forEach(([name, id]) => {
+  INPUT_FRAMES[name] = [
+    Uint8Array.of(id, ACTION_RELEASE),
+    Uint8Array.of(id, ACTION_PRESS),
+  ];
+});
 
 const state = {
   socket:               null,
@@ -23,6 +57,8 @@ const state = {
   settingsOpen:         false,
   qrStream:             null,
   qrAnimFrame:          null,
+  heartbeatIntervalId:  null,
+  heartbeatTimeoutId:   null,
 };
 
 // ─── Entry ───────────────────────────────────────────────────────────────────
@@ -31,6 +67,7 @@ document.addEventListener('DOMContentLoaded', () => {
   state.inputMode    = ls('smashpad_input')  || 'stick';
   state.mirrorLayout = ls('smashpad_mirror') === '1';
 
+  installTouchGuards();
   bindController();
   applyPlayerTheme(1);
   applyInputMode(state.inputMode, false);
@@ -366,16 +403,25 @@ function connectAs(player) {
   try { socket = new WebSocket(state.wsUrl); } catch {
     showSetup(); setSetupMessage('No se pudo abrir el WebSocket.'); return;
   }
+  socket.binaryType = 'arraybuffer';
   state.socket = socket;
 
-  socket.addEventListener('open', () => safeSend({ player }));
+  socket.addEventListener('open', () => {
+    refreshHeartbeatDeadline(socket);
+    startHeartbeat(socket);
+    safeSendRaw(PLAYER_HANDSHAKES[player]);
+  });
 
   socket.addEventListener('message', (ev) => {
-    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.status === 'connected') {
-      state.connectedPlayer = msg.player;
-      applyPlayerTheme(msg.player);
-      updatePlayerBadge(msg.player);
+    if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 2) return;
+    const msg = new Uint8Array(ev.data);
+    refreshHeartbeatDeadline(socket);
+    if (msg[0] === PROTOCOL_BUTTON_HEARTBEAT) return;
+    if (msg[0] === PROTOCOL_BUTTON_PLAYER && msg[1] >= 1 && msg[1] <= 4) {
+      const playerId = msg[1];
+      state.connectedPlayer = playerId;
+      applyPlayerTheme(playerId);
+      updatePlayerBadge(playerId);
       showController();
       setDot('connected');
       haptic('MEDIUM');
@@ -384,13 +430,16 @@ function connectAs(player) {
 
   socket.addEventListener('error', () => {
     if (state.socket !== socket) return;
+    stopHeartbeat();
     showSetup(); setDot('error');
     setSetupMessage('No se pudo conectar. Revisa la IP y la Wi-Fi.');
   });
 
   socket.addEventListener('close', () => {
     if (state.socket !== socket) return;
-    state.socket = null; releaseAllInputs();
+    stopHeartbeat();
+    state.socket = null;
+    releaseAllInputs(false);
     if (state.connectedPlayer !== null) {
       showSetup(); setSetupMessage('Conexion perdida. Toca tu jugador para volver.');
     }
@@ -399,15 +448,60 @@ function connectAs(player) {
 }
 
 function disconnect(reason) {
+  stopHeartbeat();
   releaseAllInputs();
   if (!state.socket) { state.connectedPlayer = null; return; }
   const s = state.socket; state.socket = null; state.connectedPlayer = null;
   try { s.close(1000, reason); } catch {}
 }
 
-function safeSend(payload) {
+function safeSendRaw(payload) {
   if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
-  state.socket.send(JSON.stringify(payload));
+  state.socket.send(payload);
+}
+
+function safeSendInput(button, action) {
+  const frames = INPUT_FRAMES[button];
+  if (!frames) return;
+  safeSendRaw(frames[action === ACTION_PRESS ? 1 : 0]);
+}
+
+function startHeartbeat(socket) {
+  stopHeartbeat();
+  state.heartbeatIntervalId = window.setInterval(() => {
+    if (state.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+      stopHeartbeat();
+      return;
+    }
+    safeSendRaw(HEARTBEAT_FRAME);
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (state.heartbeatIntervalId !== null) {
+    clearInterval(state.heartbeatIntervalId);
+    state.heartbeatIntervalId = null;
+  }
+  if (state.heartbeatTimeoutId !== null) {
+    clearTimeout(state.heartbeatTimeoutId);
+    state.heartbeatTimeoutId = null;
+  }
+}
+
+function refreshHeartbeatDeadline(socket) {
+  if (state.socket !== socket) return;
+  if (state.heartbeatTimeoutId !== null) clearTimeout(state.heartbeatTimeoutId);
+  state.heartbeatTimeoutId = window.setTimeout(() => {
+    if (state.socket !== socket) return;
+    stopHeartbeat();
+    state.socket = null;
+    state.connectedPlayer = null;
+    releaseAllInputs(false);
+    try { socket.close(4000, 'heartbeat-timeout'); } catch {}
+    showSetup();
+    setDot('error');
+    setSetupMessage('Conexion perdida. Toca tu jugador para volver.');
+  }, HEARTBEAT_TIMEOUT_MS);
 }
 
 // ─── Button pad ──────────────────────────────────────────────────────────────
@@ -421,26 +515,33 @@ function bindButtonPad() {
 
     const press = (e) => {
       e.preventDefault();
+      if (e.pointerId !== undefined) {
+        try { btn.setPointerCapture(e.pointerId); } catch {}
+      }
       if (btn.dataset.pressed === '1') return;
       btn.dataset.pressed = '1';
       btn.classList.add('pressed');
       state.activeButtons.add(name);
-      safeSend({ button: name, action: 'press' });
+      safeSendInput(name, ACTION_PRESS);
       haptic(name === 'A' ? 'MEDIUM' : 'LIGHT');
     };
     const release = (e) => {
       if (e) e.preventDefault();
       if (btn.dataset.pressed !== '1') return;
+      if (e?.pointerId !== undefined) {
+        try { btn.releasePointerCapture(e.pointerId); } catch {}
+      }
       btn.dataset.pressed = '0';
       btn.classList.remove('pressed');
       state.activeButtons.delete(name);
-      safeSend({ button: name, action: 'release' });
+      safeSendInput(name, ACTION_RELEASE);
     };
 
     btn.addEventListener('pointerdown', press);
     btn.addEventListener('pointerup', release);
     btn.addEventListener('pointercancel', release);
     btn.addEventListener('pointerleave', release);
+    btn.addEventListener('lostpointercapture', release);
   });
 }
 
@@ -453,26 +554,33 @@ function bindDpad() {
 
     const press = (e) => {
       e.preventDefault();
+      if (e.pointerId !== undefined) {
+        try { btn.setPointerCapture(e.pointerId); } catch {}
+      }
       if (btn.dataset.pressed === '1') return;
       btn.dataset.pressed = '1';
       btn.classList.add('pressed');
       state.activeDirections.add(name);
-      safeSend({ button: name, action: 'press' });
+      safeSendInput(name, ACTION_PRESS);
       haptic('LIGHT');
     };
     const release = (e) => {
       if (e) e.preventDefault();
       if (btn.dataset.pressed !== '1') return;
+      if (e?.pointerId !== undefined) {
+        try { btn.releasePointerCapture(e.pointerId); } catch {}
+      }
       btn.dataset.pressed = '0';
       btn.classList.remove('pressed');
       state.activeDirections.delete(name);
-      safeSend({ button: name, action: 'release' });
+      safeSendInput(name, ACTION_RELEASE);
     };
 
     btn.addEventListener('pointerdown', press);
     btn.addEventListener('pointerup', release);
     btn.addEventListener('pointercancel', release);
     btn.addEventListener('pointerleave', release);
+    btn.addEventListener('lostpointercapture', release);
   });
 }
 
@@ -530,8 +638,8 @@ function bindJoystick() {
 }
 
 function syncDirections(next) {
-  state.activeDirections.forEach(d => { if (!next.has(d)) safeSend({ button: d, action: 'release' }); });
-  next.forEach(d => { if (!state.activeDirections.has(d)) safeSend({ button: d, action: 'press' }); });
+  state.activeDirections.forEach(d => { if (!next.has(d)) safeSendInput(d, ACTION_RELEASE); });
+  next.forEach(d => { if (!state.activeDirections.has(d)) safeSendInput(d, ACTION_PRESS); });
   state.activeDirections = next;
 }
 
@@ -599,14 +707,33 @@ function handleDeviceOrientation(ev) {
 
 // ─── UI helpers ──────────────────────────────────────────────────────────────
 
-function releaseAllInputs() {
-  state.activeButtons.forEach(b => safeSend({ button: b, action: 'release' }));
+function releaseAllInputs(sendRemote = true) {
+  if (sendRemote) state.activeButtons.forEach(b => safeSendInput(b, ACTION_RELEASE));
   state.activeButtons.clear();
-  syncDirections(new Set());
+  if (sendRemote) {
+    syncDirections(new Set());
+  } else {
+    state.activeDirections.clear();
+  }
   document.querySelectorAll('[data-btn]').forEach(b => {
     b.classList.remove('pressed'); b.dataset.pressed = '0';
   });
   updateStickHandle(0, 0);
+}
+
+function installTouchGuards() {
+  const preventGesture = (e) => e.preventDefault();
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach((type) => {
+    document.addEventListener(type, preventGesture, { passive: false });
+  });
+
+  document.addEventListener('contextmenu', preventGesture);
+
+  const blockTouchScroll = (e) => {
+    if (e.touches.length > 0) e.preventDefault();
+  };
+
+  document.addEventListener('touchmove', blockTouchScroll, { passive: false });
 }
 
 function updateStickHandle(x, y) {
