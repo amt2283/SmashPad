@@ -28,6 +28,7 @@ const HEARTBEAT_INTERVAL_MS = 1000;
 const HEARTBEAT_TIMEOUT_MS = 4000;
 const PLAYER_HANDSHAKES = [null];
 const INPUT_FRAMES = Object.create(null);
+let hapticsMissingWarned = false;
 
 for (let player = 1; player <= 4; player += 1) {
   PLAYER_HANDSHAKES[player] = Uint8Array.of(PROTOCOL_BUTTON_PLAYER, player);
@@ -110,15 +111,24 @@ function buildWsUrl(hostOverride) {
 // ─── Haptics ─────────────────────────────────────────────────────────────────
 
 function haptic(style = 'LIGHT') {
-  // Capacitor native Taptic Engine (iOS)
   try {
-    if (window.Capacitor?.Plugins?.Haptics) {
-      window.Capacitor.Plugins.Haptics.impact({ style });
+    const haptics = window.Capacitor?.Plugins?.Haptics;
+    const impactStyle = window.Capacitor?.Plugins?.Haptics?.ImpactStyle;
+    if (haptics?.impact && impactStyle) {
+      const mappedStyle = impactStyle[style] || impactStyle.Light;
+      haptics.impact({ style: mappedStyle });
       return;
     }
-  } catch {}
-  // Web Vibration API (Android / Chrome)
-  try { navigator.vibrate(style === 'HEAVY' ? 55 : style === 'MEDIUM' ? 35 : 18); } catch {}
+    if (!hapticsMissingWarned) {
+      console.warn('Capacitor Haptics plugin is unavailable; skipping haptic feedback.');
+      hapticsMissingWarned = true;
+    }
+  } catch (error) {
+    if (!hapticsMissingWarned) {
+      console.warn('Capacitor Haptics plugin is unavailable; skipping haptic feedback.', error);
+      hapticsMissingWarned = true;
+    }
+  }
 }
 
 // ─── IP Screen (Capacitor) ───────────────────────────────────────────────────
@@ -195,6 +205,7 @@ function injectIpScreen() {
     probe.addEventListener('open', () => { clearTimeout(t); probe.close(); scr.remove(); initApp(); });
     probe.addEventListener('error', () => {
       clearTimeout(t);
+      scr.remove();
       err.textContent = 'No se pudo conectar. Comprueba IP y Wi-Fi.';
       btn.disabled = false;
     });
